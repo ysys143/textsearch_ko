@@ -53,6 +53,9 @@ PG_MODULE_MAGIC;
 
 #define SEPARATOR_CHAR	'\v'
 
+/* UTF-8 인코딩 '하다' (U+D558 U+B2E4): 6 bytes */
+#define HADA_BYTES		6
+
 /*
  * parser_data - 파싱 작업 중인 자료
  */
@@ -88,10 +91,16 @@ static char	*lexize(const char *str, size_t len);
 static bool	accept_mecab_ko_part(const char *str, int slen);
 static void	appendString(StringInfo dst, const unsigned char *src, int srclen);
 static bool	ismbascii(const unsigned char *s, unsigned char *c, int *cnt);
+/* 2-C 개선: OOV / 하다 / 복합명사 */
+static bool	has_hangul(const char *s, int len);
+static bool	ends_with_hada(const char *s, int slen);
+static TSLexeme *compound_lexemes(const char *base, int baselen,
+								  const char *compound, int complen);
 
 /* mecab-ko-dic 에서 사용할 품사들 */
-static char *accept_parts_of_speech[13] = {
-	"NNG" ,"NNP" ,"NNB" ,"NNBC" ,"NR" ,"VV" ,"VA" ,"MM" ,"MAG" ,"XSN" ,"XR" ,"SH", ""
+/* 2-C: SL(외래어) 추가 — 기술 문서의 영문/외래어 태그 포함 */
+static char *accept_parts_of_speech[14] = {
+	"NNG" ,"NNP" ,"NNB" ,"NNBC" ,"NR" ,"VV" ,"VA" ,"MM" ,"MAG" ,"XSN" ,"XR" ,"SH" ,"SL", ""
 };
 
 static char *ascii_sign = "`~!@#$%^&*()-=\\_+|[]{};':\",.<>/? ";
@@ -305,6 +314,10 @@ ts_mecabko_gettoken(PG_FUNCTION_ARGS)
 	}
 	else if (accept_mecab_ko_part(node->feature, strchr(node->feature, ',') - node->feature))
 		lextype = WORD_T;
+	/* 2-C: OOV 한국어 미등록어 — 사전에 없는 한글 포함 토큰은 surface 그대로 통과
+	 * lexize()에서 별도 처리 없이 surface form 인덱싱 (기술 약어, 신조어, 고유명사 보존) */
+	else if (node->stat == MECAB_UNK_NODE && has_hangul(node->surface, node->length))
+		lextype = WORD_T;
 	else
 		lextype = SPACE;
 
@@ -362,7 +375,13 @@ ts_mecabko_lexize(PG_FUNCTION_ARGS)
 	int i;
 
 	if (current_node) {
-		if ((feature(current_node, MECAB_CONJTYPE, &t, &tlen))
+		/* 2-C: OOV 미등록어 — lexize 사전 처리 없이 surface form 그대로 반환 */
+		if (current_node->stat == MECAB_UNK_NODE)
+		{
+			res = palloc0(sizeof(TSLexeme) * 2);
+			res[0].lexeme = lexize(t, tlen);
+		}
+		else if ((feature(current_node, MECAB_CONJTYPE, &t, &tlen))
 		   && (strncmp(t, "Inflect,", 8) == 0)
 		   && (feature(current_node, MECAB_DETAIL, &t, &tlen))){
 			do {
@@ -381,14 +400,43 @@ ts_mecabko_lexize(PG_FUNCTION_ARGS)
 					res[i].lexeme = lexize(t, slashpos - t);
 					i += 1;
 				}
-				if(pluspos != NULL) 
+				if(pluspos != NULL)
 					t = pluspos + 1;
 			} while (pluspos != NULL);
 		}
 		else {
-			res = palloc0(sizeof(TSLexeme) * 2);
-			feature(current_node, MECAB_BASIC, &t, &tlen);
-			res[0].lexeme = lexize(t, tlen);
+			const char *base = NULL;
+			int			baselen = 0;
+			const char *pos_str = NULL;
+			int			pos_len = 0;
+			const char *compound;
+			int			complen;
+
+			feature(current_node, MECAB_BASIC, &base, &baselen);
+			feature(current_node, 0, &pos_str, &pos_len);
+
+			/* 2-C: VV + "하다" 어미 → 기본형("모니터링하다") + NNG 어근("모니터링") 동시 인덱싱
+			 * 한국어 기술문서의 "명사+하다" 패턴: 쿼리 "모니터링"이 "모니터링하다" 문서에 히트 */
+			if (pos_str && pos_len == 2 && strncmp(pos_str, "VV", 2) == 0 &&
+				ends_with_hada(base, baselen))
+			{
+				res = palloc0(sizeof(TSLexeme) * 3);
+				res[0].lexeme = lexize(base, baselen);
+				res[1].lexeme = lexize(base, baselen - HADA_BYTES);
+			}
+			/* 2-C: NNG 복합명사 분해 — mecab-ko-dic field4 "정보/NNG+검색/NNG" 파싱
+			 * 복합체와 구성 명사 동시 인덱싱 → partial-term recall 향상 */
+			else if (pos_str && pos_len == 3 && strncmp(pos_str, "NNG", 3) == 0 &&
+					 feature(current_node, MECAB_CONJTYPE, &compound, &complen) &&
+					 memchr(compound, '/', complen) != NULL)
+			{
+				res = compound_lexemes(base, baselen, compound, complen);
+			}
+			else
+			{
+				res = palloc0(sizeof(TSLexeme) * 2);
+				res[0].lexeme = lexize(base, baselen);
+			}
 		}
 	}
 	else {
@@ -763,6 +811,93 @@ accept_mecab_ko_part(const char* str, int slen){
 		i += 1;
 	}
 	return isfind;
+}
+
+/*
+ * 2-C: has_hangul
+ * 문자열에 한글 음절(Hangul Syllables U+AC00..U+D7A3) 포함 여부 확인.
+ * UTF-8 범위: EA B0 80 .. ED 9E A3
+ */
+static bool
+has_hangul(const char *s, int len)
+{
+	const unsigned char *p = (const unsigned char *) s;
+	const unsigned char *end = p + len;
+
+	while (p < end)
+	{
+		int clen = pg_mblen((const char *) p);
+		if (clen == 3 &&
+			((p[0] == 0xEA && p[1] >= 0xB0) ||
+			 p[0] == 0xEB || p[0] == 0xEC ||
+			 (p[0] == 0xED && p[1] <= 0x9E)))
+			return true;
+		p += clen;
+	}
+	return false;
+}
+
+/*
+ * 2-C: ends_with_hada
+ * 기본형이 "하다" (U+D558 U+B2E4 = ED 95 98 EB 8B A4, 6 bytes) 로 끝나는지 확인.
+ */
+static const unsigned char hada_utf8[HADA_BYTES] = {
+	0xED, 0x95, 0x98,   /* 하 */
+	0xEB, 0x8B, 0xA4    /* 다 */
+};
+
+static bool
+ends_with_hada(const char *s, int slen)
+{
+	return slen > HADA_BYTES &&
+		memcmp(s + slen - HADA_BYTES, hada_utf8, HADA_BYTES) == 0;
+}
+
+/*
+ * 2-C: compound_lexemes
+ * mecab-ko-dic field4 복합명사 분해 정보("정보/NNG+검색/NNG")를 파싱하여
+ * 복합체 기본형 + 각 구성 명사를 TSLexeme 배열로 반환.
+ *
+ * 반환 형식: { "정보검색", "정보", "검색", NULL-terminated }
+ * PostgreSQL tsvector는 동일 position 다중 lexeme을 허용하므로
+ * 복합어 phrase matching과 partial-term recall을 동시에 제공.
+ */
+static TSLexeme *
+compound_lexemes(const char *base, int baselen,
+				 const char *compound, int complen)
+{
+	int			n = 1;
+	int			idx = 0;
+	const char *p;
+	const char *end;
+	const char *slash;
+	const char *plus;
+	TSLexeme   *res;
+
+	/* '+' 개수 = 구성요소 수 - 1 */
+	for (int i = 0; i < complen; i++)
+		if (compound[i] == '+') n++;
+
+	/* 복합체(1) + 구성요소(n) + 종결자(1) */
+	res = palloc0(sizeof(TSLexeme) * (n + 2));
+
+	/* 복합체 기본형 */
+	res[idx++].lexeme = lexize(base, baselen);
+
+	/* 각 구성요소: "word/TAG+word/TAG+..." 파싱 */
+	p = compound;
+	end = compound + complen;
+	while (p < end)
+	{
+		slash = memchr(p, '/', end - p);
+		if (!slash || slash == p)
+			break;
+		res[idx++].lexeme = lexize(p, slash - p);
+		plus = memchr(slash + 1, '+', end - slash - 1);
+		p = plus ? plus + 1 : end;
+	}
+
+	return res;  /* 마지막 항목은 palloc0으로 NULL 초기화됨 (TSLexeme terminator) */
 }
 
 /*
